@@ -25,6 +25,7 @@ import (
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
+	"github.com/redis/go-redis/v9"
 )
 
 func (s *knowledgeService) cloneKnowledge(
@@ -389,7 +390,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 		parentDBChunks = make([]*types.Chunk, len(options.ParentChunks))
 		for i, pc := range options.ParentChunks {
 			parentDBChunks[i] = &types.Chunk{
-				ID:              uuid.New().String(),
+				ID:              secutils.ChunkID(knowledge.ID, pc.Content, pc.Seq, types.ChunkTypeParentText),
 				TenantID:        knowledge.TenantID,
 				KnowledgeID:     knowledge.ID,
 				KnowledgeBaseID: knowledge.KnowledgeBaseID,
@@ -428,7 +429,7 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 
 		// 创建主文本Chunk
 		textChunk := &types.Chunk{
-			ID:              uuid.New().String(),
+			ID:              secutils.ChunkID(knowledge.ID, chunkData.Content, int(chunkData.Seq), types.ChunkTypeText),
 			TenantID:        knowledge.TenantID,
 			KnowledgeID:     knowledge.ID,
 			KnowledgeBaseID: knowledge.KnowledgeBaseID,
@@ -584,7 +585,11 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 			return
 		}
 
-		err = retrieveEngine.BatchIndex(ctx, embeddingModel, indexInfoList)
+		attachCtx := ctx
+		if s.redisClient != nil {
+			attachCtx = retriever.ContextWithEmbeddingCache(ctx, &redisEmbedCache{rdb: s.redisClient})
+		}
+		err = retrieveEngine.BatchIndex(attachCtx, embeddingModel, indexInfoList)
 		if err != nil {
 			knowledge.ParseStatus = types.ParseStatusFailed
 			knowledge.ErrorMessage = err.Error()
@@ -1123,7 +1128,7 @@ func (s *knowledgeService) ProcessSummaryGeneration(ctx context.Context, t *asyn
 		// and surfacing them in retrieved RAG context can re-introduce the
 		// hallucination vector this branch is meant to close.
 		summaryChunk := &types.Chunk{
-			ID:              uuid.New().String(),
+			ID:              secutils.ChunkID(knowledge.ID, summary, 0, types.ChunkTypeSummary),
 			TenantID:        knowledge.TenantID,
 			KnowledgeID:     knowledge.ID,
 			KnowledgeBaseID: knowledge.KnowledgeBaseID,
@@ -2501,7 +2506,7 @@ func (s *knowledgeService) UpdateImageInfo(
 	// Create a new caption chunk if it doesn't exist and we have caption data
 	if !hasCaptionChunk && image.Caption != "" {
 		captionChunk := &types.Chunk{
-			ID:              uuid.New().String(),
+			ID:              secutils.ImageChunkID(chunk.ID, "caption", image.Caption),
 			TenantID:        tenantID,
 			KnowledgeID:     chunk.KnowledgeID,
 			KnowledgeBaseID: chunk.KnowledgeBaseID,
@@ -2517,7 +2522,7 @@ func (s *knowledgeService) UpdateImageInfo(
 	// Create a new OCR chunk if it doesn't exist and we have OCR data
 	if !hasOCRChunk && image.OCRText != "" {
 		ocrChunk := &types.Chunk{
-			ID:              uuid.New().String(),
+			ID:              secutils.ImageChunkID(chunk.ID, "ocr", image.OCRText),
 			TenantID:        tenantID,
 			KnowledgeID:     chunk.KnowledgeID,
 			KnowledgeBaseID: chunk.KnowledgeBaseID,
@@ -3431,4 +3436,29 @@ func (s *knowledgeService) ProcessKnowledgeListReparse(ctx context.Context, t *a
 	logger.Infof(ctx, "Knowledge list reparse task finished: %d submitted, %d failed",
 		len(payload.KnowledgeIDs)-failed, failed)
 	return nil
+}
+
+// redisEmbedCache adapts a raw *redis.Client to the retriever.EmbeddingCache
+// interface so the embedding cache can be threaded via context without
+// modifying the RetrieveEngineService interface.
+type redisEmbedCache struct {
+	rdb *redis.Client
+}
+
+func (c *redisEmbedCache) Get(ctx context.Context, key string) (string, bool) {
+	if c.rdb == nil {
+		return "", false
+	}
+	val, err := c.rdb.Get(ctx, key).Result()
+	if err != nil {
+		return "", false
+	}
+	return val, true
+}
+
+func (c *redisEmbedCache) Set(ctx context.Context, key, value string) error {
+	if c.rdb == nil {
+		return nil
+	}
+	return c.rdb.Set(ctx, key, value, 0).Err()
 }

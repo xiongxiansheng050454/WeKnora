@@ -2,6 +2,10 @@ package retriever
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"regexp"
 	"slices"
 	"strings"
@@ -35,6 +39,28 @@ var embeddingImagePayloadPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?is)!\[[^\]]*\]\(\s*data:image/[a-z0-9.+-]+;base64,[^)]+\)`),
 	regexp.MustCompile(`(?i)data:image/[a-z0-9.+-]+;base64,[a-z0-9+/=]{200,}`),
 	regexp.MustCompile(`(?i)data:[a-z0-9.+/-]+;base64,[a-z0-9+/=]{200,}`),
+}
+
+// embedCacheContextKey is the context key for an optional embedding cache.
+// When set, BatchIndex checks the cache before calling the embedding API.
+type embedCacheContextKey struct{}
+
+// EmbeddingCache is the minimal interface the retriever needs to cache
+// embedding vectors. Implementations are provided by the service layer.
+type EmbeddingCache interface {
+	Get(ctx context.Context, key string) (string, bool)
+	Set(ctx context.Context, key, value string) error
+}
+
+// ContextWithEmbeddingCache attaches an embedding cache to ctx.
+func ContextWithEmbeddingCache(ctx context.Context, c EmbeddingCache) context.Context {
+	return context.WithValue(ctx, embedCacheContextKey{}, c)
+}
+
+// EmbeddingCacheFromContext extracts the embedding cache from ctx (nil if unset).
+func EmbeddingCacheFromContext(ctx context.Context) EmbeddingCache {
+	c, _ := ctx.Value(embedCacheContextKey{}).(EmbeddingCache)
+	return c
 }
 
 // KeywordsVectorHybridRetrieveEngineService implements a hybrid retrieval engine
@@ -96,7 +122,11 @@ func (v *KeywordsVectorHybridRetrieveEngineService) BatchIndex(ctx context.Conte
 		for _, indexInfo := range indexInfoList {
 			contentList = append(contentList, sanitizeForEmbedding(ctx, indexInfo.Content))
 		}
-		embeddings, err := batchEmbedWithBackoff(ctx, embedder, contentList)
+
+		modelID := embedder.GetModelID()
+		dim := embedder.GetDimensions()
+		cache := EmbeddingCacheFromContext(ctx)
+		embeddings, err := cachedBatchEmbed(ctx, cache, embedder, modelID, dim, contentList)
 		if err != nil {
 			return err
 		}
@@ -150,6 +180,74 @@ func batchEmbedWithBackoff(ctx context.Context, embedder embedding.Embedder, con
 		}
 	}
 	return embeddings, err
+}
+
+// cachedBatchEmbed wraps batchEmbedWithBackoff with an LRU-style content-
+// addressed cache. When cache is nil it passes through directly.
+// For each content string the cache key is:
+//
+//	emb:{SHA256(content)}:{modelID}:{dim}
+//
+// Hits skip the embedding API; misses are fetched in bulk and stored.
+func cachedBatchEmbed(ctx context.Context, cache EmbeddingCache, embedder embedding.Embedder,
+	modelID string, dim int, contentList []string,
+) ([][]float32, error) {
+	if cache == nil {
+		return batchEmbedWithBackoff(ctx, embedder, contentList)
+	}
+
+	// 1. Partition: determine which contents are cached.
+	results := make([][]float32, len(contentList))
+	var missIdx []int
+	var missContent []string
+	for i, content := range contentList {
+		key := embedCacheKey(content, modelID, dim)
+		if cached, hit := cache.Get(ctx, key); hit {
+			var emb []float32
+			if err := json.Unmarshal([]byte(cached), &emb); err != nil {
+				logger.Warnf(ctx, "embedding cache deserialise error for key %s: %v, re-embedding", key, err)
+				missIdx = append(missIdx, i)
+				missContent = append(missContent, content)
+			} else {
+				results[i] = emb
+			}
+		} else {
+			missIdx = append(missIdx, i)
+			missContent = append(missContent, content)
+		}
+	}
+
+	// All cached → fast path.
+	if len(missContent) == 0 {
+		return results, nil
+	}
+
+	logger.Infof(ctx, "embedding cache: %d hits, %d misses (fetching %d)", len(results)-len(missContent), len(missContent), len(missContent))
+
+	// 2. Fetch misses from API.
+	missEmb, err := batchEmbedWithBackoff(ctx, embedder, missContent)
+	if err != nil {
+		return nil, err
+	}
+
+	// 3. Stitch and store in cache.
+	for j, i := range missIdx {
+		results[i] = missEmb[j]
+		key := embedCacheKey(missContent[j], modelID, dim)
+		if raw, err := json.Marshal(missEmb[j]); err == nil {
+			if setErr := cache.Set(ctx, key, string(raw)); setErr != nil {
+				logger.Warnf(ctx, "embedding cache set error for key %s: %v", key, setErr)
+			}
+		}
+	}
+	return results, nil
+}
+
+// embedCacheKey builds the Redis key for an embedding vector.
+func embedCacheKey(content, modelID string, dim int) string {
+	h := sha256.Sum256([]byte(content))
+	contentHash := hex.EncodeToString(h[:])
+	return "emb:" + contentHash + ":" + modelID + ":" + fmt.Sprintf("%d", dim)
 }
 
 // sanitizeForEmbedding caps content length at safetyMaxChars characters so

@@ -19,7 +19,6 @@ import (
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
-	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 	"github.com/redis/go-redis/v9"
 )
@@ -85,6 +84,10 @@ type ImageMultimodalService struct {
 	// the knowledge base's currently configured one.
 	resourceCatalog interfaces.ResourceCatalog
 
+	// cache provides content-addressed caching for VLM results (OCR/caption).
+	// nil-safe: when redis is unavailable all operations are no-ops.
+	cache *Cache
+
 	// spanTracker records this image's subspan under the parent attempt's
 	// multimodal stage. nil-safe — falls back to no-op via tracker().
 	spanTracker SpanTracker
@@ -117,6 +120,7 @@ func NewImageMultimodalService(
 		ollamaService:   ollamaService,
 		taskEnqueuer:    taskEnqueuer,
 		redisClient:     redisClient,
+		cache:           NewCache(redisClient),
 		fileSvc:         fileSvc,
 		storageResolver: storageResolver,
 		resourceCatalog: resourceCatalog,
@@ -252,6 +256,14 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 	}
 	imgOut["image_bytes"] = len(imgBytes)
 
+	// VLM cache key material: content hash of image bytes + model id
+	imgHash := secutils.ContentHash(string(imgBytes))
+	vlmModelID := strings.TrimSpace(vlmModel.GetModelID())
+	if vlmModelID == "" {
+		vlmModelID = "unknown"
+	}
+	imgOut["img_hash"] = imgHash[:16]
+
 	imageInfo := types.ImageInfo{
 		URL:         payload.ImageURL,
 		OriginalURL: payload.ImageURL,
@@ -268,7 +280,22 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 		}
 		prompt = types.AppendCustomPromptInstructions(prompt, vlmCfg.CustomInstructions, "image_ocr")
 
-		ocrText, ocrErr := vlmModel.Predict(ctx, [][]byte{imgBytes}, prompt)
+		ocrPromptHash := secutils.ContentHash(prompt)
+		ocrCacheKey := VLMCacheKey(imgHash, vlmModelID, ocrPromptHash)
+		var ocrText string
+		var ocrErr error
+		if cached, hit := s.cache.Get(ctx, ocrCacheKey); hit {
+			ocrText = cached
+			ocrErr = nil
+			imgOut["ocr_cache_hit"] = true
+			logger.Infof(ctx, "[ImageMultimodal] OCR cache HIT for %s", payload.ImageURL)
+		} else {
+			ocrText, ocrErr = vlmModel.Predict(ctx, [][]byte{imgBytes}, prompt)
+			if ocrErr == nil && ocrText != "" {
+				s.cache.Set(ctx, ocrCacheKey, ocrText, 0)
+				imgOut["ocr_cached"] = true
+			}
+		}
 		if ocrErr != nil {
 			logger.Warnf(ctx, "[ImageMultimodal] OCR failed for %s: %v", payload.ImageURL, ocrErr)
 			imgOut["ocr_error"] = ocrErr.Error()
@@ -286,7 +313,23 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 		}
 	}
 
-	caption, capErr := vlmModel.Predict(ctx, [][]byte{imgBytes}, buildVLMCaptionPrompt(ctx, vlmCfg))
+	captionPrompt := buildVLMCaptionPrompt(ctx, vlmCfg)
+	captionPromptHash := secutils.ContentHash(captionPrompt)
+	capCacheKey := VLMCacheKey(imgHash, vlmModelID, captionPromptHash)
+	var caption string
+	var capErr error
+	if cached, hit := s.cache.Get(ctx, capCacheKey); hit {
+		caption = cached
+		capErr = nil
+		imgOut["caption_cache_hit"] = true
+		logger.Infof(ctx, "[ImageMultimodal] Caption cache HIT for %s", payload.ImageURL)
+	} else {
+		caption, capErr = vlmModel.Predict(ctx, [][]byte{imgBytes}, captionPrompt)
+		if capErr == nil && caption != "" {
+			s.cache.Set(ctx, capCacheKey, caption, 0)
+			imgOut["caption_cached"] = true
+		}
+	}
 	if capErr != nil {
 		logger.Warnf(ctx, "[ImageMultimodal] Caption failed for %s: %v", payload.ImageURL, capErr)
 		imgOut["caption_error"] = capErr.Error()
@@ -302,7 +345,7 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 
 	if imageInfo.OCRText != "" {
 		newChunks = append(newChunks, &types.Chunk{
-			ID:              uuid.New().String(),
+			ID:              secutils.ImageChunkID(payload.ChunkID, "ocr", imageInfo.OCRText),
 			TenantID:        payload.TenantID,
 			KnowledgeID:     payload.KnowledgeID,
 			KnowledgeBaseID: payload.KnowledgeBaseID,
@@ -319,7 +362,7 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 
 	if imageInfo.Caption != "" {
 		newChunks = append(newChunks, &types.Chunk{
-			ID:              uuid.New().String(),
+			ID:              secutils.ImageChunkID(payload.ChunkID, "caption", imageInfo.Caption),
 			TenantID:        payload.TenantID,
 			KnowledgeID:     payload.KnowledgeID,
 			KnowledgeBaseID: payload.KnowledgeBaseID,
