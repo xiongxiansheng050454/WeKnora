@@ -6191,6 +6191,7 @@ export default {
       duration: 'Duration',
     },
     connector: {
+      dingtalk: 'DingTalk',
       feishu: 'Feishu',
       lark: 'Lark',
       notion: 'Notion',
@@ -6198,6 +6199,7 @@ export default {
       rss: 'RSS / Atom Feed',
     },
     connectorDesc: {
+      dingtalk: 'Sync documents from DingTalk workspaces',
       feishu: 'Sync documents, spreadsheets and files from Feishu Wiki',
       lark: 'Sync documents, spreadsheets and files from Lark Wiki (Feishu international)',
       notion: 'Sync pages and databases from Notion',
@@ -6205,6 +6207,7 @@ export default {
       rss: 'Sync articles from RSS / Atom feeds',
     },
     field: {
+      appKey: 'App Key',
       appId: 'App ID',
       appSecret: 'App Secret',
       integrationToken: 'Integration Token',
